@@ -23,6 +23,7 @@ canvas#c{position:fixed;inset:0;width:100%;height:100%;display:block}
 .chips{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .chip{font:500 11px var(--f-mono);padding:5px 9px;border-radius:99px;background:var(--panel);border:1px solid var(--line);color:var(--mute);white-space:nowrap;backdrop-filter:blur(8px)}
 .chip b{color:var(--ink);font-weight:500}
+.ibar{display:inline-block;width:46px;height:5px;border-radius:3px;background:rgba(255,255,255,.1);vertical-align:middle;margin-right:4px;overflow:hidden}.ibar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--b),var(--a),#ff5d8f);border-radius:3px}
 .chip.hot{color:var(--a);border-color:rgba(61,245,166,.4)}
 .feed{position:fixed;left:max(18px,env(safe-area-inset-left));top:calc(64px + env(safe-area-inset-top));display:grid;gap:4px;z-index:2;pointer-events:none;transition:opacity .6s}
 .feed div{font:500 11px var(--f-mono);color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:4px 8px;width:max-content;animation:feedIn .35s cubic-bezier(.2,.8,.2,1),feedOut .6s 3.4s forwards}
@@ -60,6 +61,7 @@ body.zen .hud,body.zen .feed{opacity:0!important;pointer-events:none}
   <div class="chips">
     <span class="chip" id="c-src">en attente</span>
     <span class="chip" id="c-sec">—</span>
+    <span class="chip" id="c-int"><span class="ibar"><i></i></span> intensité</span>
     <span class="chip opt" id="c-bpm">— BPM</span>
     <span class="chip opt" id="c-note">—</span>
   </div>
@@ -171,11 +173,12 @@ const F = {
   chroma:new Float32Array(12), hue:150, pc:-1, pcStrength:0, voice:0,
   kick:0, snare:0, hat:0, bassHit:0,   // enveloppes d'attaque (0..1, décroissent)
   lastK:0, lastS:0, lastH:0, lastB:0, lastSub:0, low:0, lowAvg:0, lowPush:0,
+  raw:new Float32Array(NB), lvF:-60, lvM:-60, peak:-1, floor:0, act:0, xF:0, xM:0, rel:0, relM:0, dip:0, inDip:false, dipAt:0, dipEnd:0, heat:0, I:0,
   section:"calme", sectionSince:0, bpm:0, beatPhase:0, lastBeatT:0,
   history:[], profile:[], novelty:0, lastMoment:0, silentSince:0,
   onsetEnv:new Float32Array(480), oi:0
 };
-function resetAnalysis(){ F.max.fill(.05); F.fluxM.fill(0); F.fluxV.fill(0); F.history = []; F.profile = []; F.loudS = -60; F.loudMax = -30; F.lastMoment = performance.now(); F.onsetEnv.fill(0); }
+function resetAnalysis(){ F.peak = -1; F.floor = 0; F.heat = 0; F.lvF = F.lvM = -60; F.max.fill(.05); F.fluxM.fill(0); F.fluxV.fill(0); F.history = []; F.profile = []; F.loudS = -60; F.loudMax = -30; F.lastMoment = performance.now(); F.onsetEnv.fill(0); }
 
 function analyse(now, dt){
   if (!analyser){ decayAll(dt); return; }
@@ -189,6 +192,7 @@ function analyse(now, dt){
   F.loudF += (db - F.loudF) * (1 - Math.exp(-dt/0.18));
   F.loudS += (db - F.loudS) * (1 - Math.exp(-dt/6));
   F.loudMax = Math.max(F.loudF, F.loudMax - dt*0.8);
+  F.db = db;
   // --- bandes (magnitudes linéaires), normalisation auto (AGC) et flux
   const mag = i => Math.pow(10, fbuf[i]/20);
   let num = 0, den = 0, logSum = 0, linSum = 0, cnt = 0;
@@ -197,6 +201,7 @@ function analyse(now, dt){
     let e = 0; for (let i = i0; i <= i1; i++){ const m = mag(i); e += m*m; }
     e = Math.sqrt(e / (i1-i0+1)) * g * 60;
     const v = Math.log1p(e*4);                                          // compression perceptive
+    F.raw[b] = v;
     F.max[b] = Math.max(v, F.max[b] * Math.exp(-dt/8), .04);            // gain automatique sur ~8 s
     const nv = clamp(v / F.max[b]);
     const flux = Math.max(0, nv - F.n[b]);
@@ -247,6 +252,30 @@ function analyse(now, dt){
   // --- énergie globale
   const inten = clamp((F.loudF + 52) / 40);
   F.energy += ((inten*.5 + (F.n[1]+F.n[2])*.25 + (F.n[4]+F.n[5])*.12 + F.n[6]*.08) - F.energy) * (1 - Math.exp(-dt/0.15));
+  // --- intensité : réflexe (~40 ms) contre tendance (1,5 s) contre mémoire du morceau
+  F.lvF += (db - F.lvF)*(1 - Math.exp(-dt/(db > F.lvF ? 0.025 : 0.06)));
+  F.lvM += (F.lvF - F.lvM)*(1 - Math.exp(-dt/1.5));
+  // « densité » : volume + nombre de coups + largeur du spectre + brillance — ce qui fait qu'un passage paraît chargé
+  F.act = F.act*Math.exp(-dt/1.5) + (kv + sv + .3*hv)*.25;
+  let wide = 0; for (let b = 0; b < NB; b++) wide += F.raw[b]; wide /= NB; F.wide = wide;
+  const X = .3*clamp((F.lvF + 50)/35) + .28*clamp(F.act/2) + .22*wide + .2*(F.n[5] + F.n[6])/2;
+  F.xF += (X - F.xF)*(1 - Math.exp(-dt/0.05)); F.xM += (F.xF - F.xM)*(1 - Math.exp(-dt/2));
+  if (F.lvF > -58){
+    if (F.peak < 0){ F.peak = Math.max(F.xM + .05, .78); F.floor = Math.min(F.xM - .05, .2); }   // a priori absolu, affiné ensuite par le morceau
+    F.peak = Math.max(F.xM, F.peak - dt*0.003);                // le plus chargé entendu dans le morceau (s'oublie lentement)
+    F.floor = Math.min(F.xM, F.floor + dt*0.003);              // le plus calme
+    F._loudAt = now;
+  } else if (now - (F._loudAt || 0) > 2500){ F.peak = -1; }    // longue pause = sans doute un nouveau morceau : on réapprend
+  const span = Math.max(.38, F.peak - F.floor), mid = (F.peak + F.floor)/2, lo = Math.min(F.floor, mid - span/2);
+  F.rel  = clamp((F.xF - lo)/span);                            // où on est, instantanément, dans la plage du morceau
+  F.relM = clamp((F.xM - lo)/span);
+  F.dip  = clamp((F.lvM - F.lvF - 2.5)/8);                     // chute brutale par rapport à la tendance
+  if (!F.inDip && F.dip > .45 && now - F.dipEnd > 250){ F.inDip = true; F.dipAt = now; EV.emit("dip", F.dip); }
+  if (F.inDip && F.lvF > F.lvM - 1){ F.inDip = false; F.dipEnd = now; EV.emit("relance", clamp((now - F.dipAt)/700, .5, 1.3)); }
+  // chaleur : monte doucement tant que le morceau reste dans le haut de sa plage (un drop commence, puis grandit)
+  const holding = F.inDip || F.lvF < -58 || now - F.dipEnd < 1500;     // une coupure ne casse pas l'élan du drop
+  F.heat = clamp(F.heat + dt*(F.relM > .72 ? .045 + .05*F.kick : holding ? -.03 : -(.08 + .5*(.72 - F.relM))));
+  F.I = clamp(.4*F.rel + .2*F.relM + .4*F.heat) * (1 - .75*F.dip);
   // --- tempo : autocorrélation de l'enveloppe des attaques (~8 s)
   F.fps = F.fps ? lerp(F.fps, 1/Math.max(dt,.004), .02) : 60;
   F.onsetEnv[F.oi++ % F.onsetEnv.length] = kv*1 + sv*.7 + hv*.15;
@@ -255,7 +284,7 @@ function analyse(now, dt){
   sections(now, db);
   novelty(now);
 }
-function decayAll(dt){ for (let b = 0; b < NB; b++) F.n[b] *= .92; F.energy *= .95; F.low *= .9; F.lowPush *= .9; F.kick *= .9; F.snare *= .9; F.hat *= .85; F.voice *= .95; }
+function decayAll(dt){ for (let b = 0; b < NB; b++) F.n[b] *= .92; F.energy *= .95; F.I *= .92; F.low *= .9; F.lowPush *= .9; F.kick *= .9; F.snare *= .9; F.hat *= .85; F.voice *= .95; }
 
 function estimateTempo(){
   const N = F.onsetEnv.length, env = new Float32Array(N), start = F.oi % N;
@@ -282,7 +311,7 @@ function sections(now, db){
   const avg = (a,k) => a.reduce((x,y) => x + y[k], 0) / a.length;
   const slope = avg(recent,"l") - avg(older,"l"), hiRise = (avg(recent,"h") + avg(recent,"s")) - (avg(older,"h") + avg(older,"s"));
   const since = now - F.sectionSince;
-  if (db < -58){ if (!F.silentSince) F.silentSince = now; if (now - F.silentSince > 900) setSection("silence", now); return; }
+  if (db < -58){ if (!F.silentSince) F.silentSince = now; if (now - F.silentSince > 2200) setSection("silence", now); return; }
   F.silentSince = 0;
   if ((F.section === "montée" || F.section === "break" || F.section === "silence") && F.loudF > F.loudS + 4 && F.kick > .5) { setSection("drop", now); return; }
   if (slope > 2.2 && hiRise > .1 && since > 1500 && F.section !== "drop") { setSection("montée", now); return; }
@@ -323,6 +352,8 @@ const M = 180;                                    // points de la membrane
 const mem = { d:new Float32Array(M), v:new Float32Array(M), f:new Float32Array(M), rot:0, rotV:.15, k:3, kT:3, kMix:1, lobe:0, punch:0, tight:0, calm:0, flash:0, hueShift:0, twist:0, layersPhase:0 };
 const echoes = [], drops = [], sparks = [], bassRings = [];
 const cam = { kick:0, bass:0, sx:0, sy:0 };
+// rotation 3D de l'objet sur lui-même : inclinaison (rx, ry) + retournements complets
+const o3 = { px:0, py:1.3, rx:0, ry:0, flip:0, flipT:0, flipAxis:0, I:0, dip:0, spread:0 };
 const dust = Array.from({length:420}, () => ({ a:Math.random()*TAU, r:Math.random(), z:Math.random(), v:0, life:Math.random() }));
 const col = (h, s, l, a=1) => `hsla(${((h%360)+360)%360},${s}%,${l}%,${a})`;
 
@@ -330,14 +361,23 @@ function impulse(angle, amp, width){             // coup sur la membrane, qui se
   const c = Math.round(((angle % TAU + TAU) % TAU) / TAU * M);
   for (let j = -width; j <= width; j++){ const i = (c + j + M) % M, w = Math.exp(-(j*j)/(2*(width/2.5)**2)); mem.v[i] += amp*w; }
 }
-function radiusAt(i){
-  const th = i/M*TAU, k = mem.k, lobe = mem.lobe * Math.cos(k*(th + mem.rot*.3)) * (1 - mem.calm*.7);
-  const B = UI.bass;
-  return R*(.9 + .16*F.low*B + .38*F.lowPush*B + .1*F.n[0]*B - .12*mem.tight + .2*mem.punch*B) * (1 + lobe*.3) + mem.d[i]*R*(1 + .4*F.lowPush*B);
+function radiusAt(i, ph=0){
+  const th = i/M*TAU, k = mem.k, lobe = mem.lobe * Math.cos(k*(th + mem.rot*.3) + ph) * (1 - mem.calm*.7);
+  const B = UI.bass, size = (.72 + .4*o3.I) * (1 - .28*o3.dip);   // l'intensité ressentie fixe la taille, une chute la contracte d'un coup
+  return R*size*(.9 + .16*F.low*B + .38*F.lowPush*B + .1*F.n[0]*B - .12*mem.tight + .2*mem.punch*B) * (1 + lobe*.3) + mem.d[i]*R*(1 + .4*F.lowPush*B);
 }
-function shape(scale=1, rotOff=0){
+function proj(x, y, z){                           // rotation 3D puis perspective
+  const cy = Math.cos(o3.ry), sy = Math.sin(o3.ry), cx = Math.cos(o3.rx), sx = Math.sin(o3.rx);
+  const x1 = x*cy + z*sy, z1 = -x*sy + z*cy, y1 = y*cx - z1*sx, z2 = y*sx + z1*cx;
+  const f = R*4.2, p = f/(f + Math.max(z2, -f*.45));
+  return [CX + x1*p, CY + y1*p, z2];
+}
+function shape(scale=1, rotOff=0, z0=0, ph=0, flat=false){
   const pts = new Array(M);
-  for (let i = 0; i < M; i++){ const th = i/M*TAU + mem.rot + rotOff, r = radiusAt(i)*scale; pts[i] = [CX + Math.cos(th)*r, CY + Math.sin(th)*r]; }
+  for (let i = 0; i < M; i++){
+    const th = i/M*TAU + mem.rot + rotOff, r = radiusAt(i, ph)*scale;
+    pts[i] = flat ? [CX + Math.cos(th)*r, CY + Math.sin(th)*r] : proj(Math.cos(th)*r, Math.sin(th)*r, z0 - mem.d[i]*R*.9);   // les bosses sortent vers l'avant
+  }
   return pts;
 }
 function pathOf(pts){
@@ -356,7 +396,7 @@ EV.on("kick", v => {
   mem.punch = Math.max(mem.punch, .7*v);
   cam.kick = Math.max(cam.kick, v*B);
   cam.sx += (Math.random()-.5)*10*v*B; cam.sy += (Math.random()-.5)*10*v*B;
-  echoes.push({ pts: shape(1.02), s:1, a:.6*v, w:3 + 7*v*B, hue:F.hue });
+  echoes.push({ pts: shape(1.02, 0, 0, 0), s:1, a:.6*v, w:3 + 7*v*B, hue:F.hue });
   if (echoes.length > 14) echoes.shift();
   dust.forEach(p => p.v += .004*v*(1 - p.r));
 });
@@ -384,12 +424,14 @@ EV.on("moment", v => {
   mem.hueShift += (Math.random() < .5 ? 1 : -1) * (30 + 60*v);
   mem.twist = (Math.random()-.5) * 2 * v;
   mem.flash = Math.max(mem.flash, .25*v);
-  echoes.push({ pts: shape(1.05), s:1, a:.7, w:6, hue:F.hue + mem.hueShift });
+  if (v > .6 && o3.I > .45 && !o3.flipT) startFlip();
+  echoes.push({ pts: shape(1.05, 0, 0, 0), s:1, a:.7, w:6, hue:F.hue + mem.hueShift });
   pushFeed("✦", `nouvelle texture · ${mem.kT} branches`);
 });
 EV.on("section", ({name, prev}) => {
   $("#c-sec").innerHTML = `<b>${name}</b>`;
   if (name === "drop"){
+    F.heat = Math.max(F.heat, .15);
     mem.flash = 1; mem.punch = 1.2; mem.tight = 0;
     for (let i = 0; i < M; i += 3) impulse(i/M*TAU, .12*UI.react, 6);
     for (let j = 0; j < 30; j++) spawnDrop(Math.floor(Math.random()*M), .8 + .7*Math.random());
@@ -400,6 +442,19 @@ EV.on("section", ({name, prev}) => {
   pushFeed(name === "drop" ? "💥" : name === "montée" ? "↗" : name === "break" ? "◌" : "•", name === "drop" ? "DROP" : `partie : ${name}`);
 });
 
+function startFlip(){ o3.flipT = 1e-3; o3.flipAxis = Math.random() < .5 ? 0 : 1; o3.flipDir = Math.random() < .5 ? 1 : -1; }
+EV.on("dip", v => { pushFeed("▾", "ça retombe"); });
+EV.on("relance", v => {
+  // la musique repart : tout se rouvre d'un coup
+  for (let i = 0; i < M; i += 4) impulse(i/M*TAU, .1*v*UI.react, 6);
+  mem.punch = Math.max(mem.punch, 1.1*v); cam.kick = Math.max(cam.kick, 1.3*v); mem.flash = Math.max(mem.flash, .5*v);
+  o3.py += 1.2*v;
+  for (let j = 0; j < 40*v; j++) sparks.push({ a:Math.random()*TAU, r:1, v:.02 + .04*Math.random()*v, life:1, hue:F.hue + Math.random()*60 });
+  for (let j = 0; j < 8*v; j++) spawnDrop(Math.floor(Math.random()*M), .7 + .6*Math.random());
+  echoes.push({ pts: shape(1.05, 0, 0, 0), s:1, a:.9, w:10, hue:F.hue + 40 });
+  if (v > .9 && o3.I > .4) startFlip();
+  pushFeed("▴", "ça repart");
+});
 function spawnDrop(i, power){
   if (drops.length > 90) drops.shift();
   drops.push({ i, h:0, v:power * R * .045 * UI.react, life:1, neck:1, size: .7 + .6*Math.random(), hue: F.hue + (Math.random()-.5)*40 });
@@ -436,11 +491,23 @@ function step(dt, now){
   mem.k = lerp(mem.k, mem.kT, clamp(dt*1.6));
   // rotation : plus rapide en montée, ralentie en break
   const target = (F.section === "montée" ? 1.4 : F.section === "break" ? .08 : F.section === "drop" ? .9 : .25 + .5*F.energy) * Math.sign(mem.rotV || 1);
-  mem.rotV = lerp(mem.rotV, target, clamp(dt*1.2)); mem.rot += mem.rotV*dt;
+  mem.rotV = lerp(mem.rotV, target*(.4 + 1.2*o3.I), clamp(dt*1.2)); mem.rot += mem.rotV*dt*(1 - .8*o3.dip);
   mem.lobe *= Math.exp(-dt/0.6); mem.punch *= Math.exp(-dt/0.25); mem.flash *= Math.exp(-dt/0.35);
   mem.tight = lerp(mem.tight, F.section === "montée" ? clamp((now - F.sectionSince)/6000) : 0, clamp(dt*2));
   mem.calm = lerp(mem.calm, F.section === "break" || F.section === "calme" || F.section === "silence" ? 1 : 0, clamp(dt*.8));
   mem.twist *= Math.exp(-dt/6);
+  // intensité visuelle : suit le son en ~50 ms (montée) / ~120 ms (descente) → on VOIT chaque creux
+  o3.I += (F.I - o3.I)*clamp(dt/(F.I > o3.I ? .05 : .12));
+  o3.dip += (F.dip - o3.dip)*clamp(dt/(F.dip > o3.dip ? .03 : .1));
+  o3.spread += (o3.I - o3.spread)*clamp(dt/.25);
+  // rotation sur elle-même : vitesse et amplitude d'inclinaison suivent l'intensité, les kicks donnent des à-coups
+  const sp = (.15 + 1.5*o3.I*o3.I) * (1 - .85*o3.dip);
+  o3.px += dt*sp*.77 + .05*F.kick*dt*20; o3.py += dt*sp;
+  const amp = (.18 + .95*o3.I) * (1 - .7*o3.dip);
+  let rx = amp*Math.sin(o3.px)*.85, ry = amp*Math.sin(o3.py);
+  if (o3.flipT){ o3.flipT += dt/1.1; const t = clamp(o3.flipT), e2 = t < .5 ? 4*t*t*t : 1 - (-2*t + 2)**3/2;
+    if (o3.flipAxis) ry += o3.flipDir*e2*TAU; else rx += o3.flipDir*e2*TAU; if (o3.flipT >= 1) o3.flipT = 0; }
+  o3.rx = lerp(o3.rx, rx, clamp(dt*12)); o3.ry = lerp(o3.ry, ry, clamp(dt*12));
   cam.kick *= Math.exp(-dt/0.12); cam.bass *= Math.exp(-dt/0.4); cam.sx *= Math.exp(-dt/0.06); cam.sy *= Math.exp(-dt/0.06);
   for (const b of bassRings){ b.r += dt*(1.2 + 1.5*F.low); b.a *= Math.exp(-dt/0.7); }
   for (let i = bassRings.length - 1; i >= 0; i--) if (bassRings[i].a < .02) bassRings.splice(i, 1);
@@ -461,10 +528,10 @@ function draw(now){
   ctx.setTransform(DPR,0,0,DPR,0,0);
   // traînées : plus longues quand ça s'emballe
   ctx.globalCompositeOperation = "source-over";
-  ctx.fillStyle = `rgba(5,6,7,${.16 + .22*(1 - e) + .2*mem.calm})`; ctx.fillRect(0,0,W,Hh);
+  ctx.fillStyle = `rgba(5,6,7,${.16 + .22*(1 - o3.I) + .2*mem.calm + .35*o3.dip})`; ctx.fillRect(0,0,W,Hh);
   // halo de fond coloré par l'harmonie
   const bg = ctx.createRadialGradient(CX, CY, R*.2, CX, CY, Math.max(W,Hh)*.7);
-  bg.addColorStop(0, col(hue, sat, 12 + 18*e + 26*F.lowPush*UI.bass + 30*mem.flash, .35 + .3*F.lowPush)); bg.addColorStop(1, "rgba(5,6,7,0)");
+  bg.addColorStop(0, col(hue, sat*(1 - .6*o3.dip), (12 + 22*o3.I + 26*F.lowPush*UI.bass + 30*mem.flash)*(1 - .6*o3.dip), .35 + .3*F.lowPush)); bg.addColorStop(1, "rgba(5,6,7,0)");
   ctx.fillStyle = bg; ctx.fillRect(0,0,W,Hh);
   // caméra : zoom sur chaque kick, secousse, respiration de la basse
   const z = 1 + .05*cam.kick + .03*cam.bass + .04*F.lowPush*UI.bass;
@@ -489,26 +556,45 @@ function draw(now){
   for (const s of sparks){ const r = R*(1.1 + s.r*2.2), x = CX + Math.cos(s.a)*r, y = CY + Math.sin(s.a)*r;
     ctx.fillStyle = col(s.hue, 95, 70, s.life*.8); ctx.beginPath(); ctx.arc(x, y, 1.2 + 1.5*s.life, 0, TAU); ctx.fill(); }
 
-  // membrane : 3 couches (extérieure, intermédiaire décalée, cœur-voix)
-  const outer = shape(1), mid = shape(.72, .35 + mem.twist*.5), inner = shape(.42 + .1*F.voice, -.5);
-  ctx.globalCompositeOperation = "source-over";
-  const gOut = ctx.createRadialGradient(CX, CY, R*.1, CX, CY, R*1.5);
-  gOut.addColorStop(0, col(hue, sat, 55 + 15*e, .95)); gOut.addColorStop(.6, col(hue + 25, sat, 32 + 10*e, .9)); gOut.addColorStop(1, col(hue + 50, sat, 14, .85));
-  pathOf(outer); ctx.fillStyle = gOut; ctx.fill();
-  ctx.lineWidth = 1.5 + 3*F.n[5] + 4*F.snare; ctx.strokeStyle = col(hue - 20, 95, 72, .55 + .4*F.snare); ctx.stroke();
-  ctx.globalCompositeOperation = "lighter";
-  pathOf(mid); ctx.fillStyle = col(hue + 60, 90, 45, .18 + .25*F.n[3]); ctx.fill();
-  ctx.lineWidth = 1 + 2*F.n[4]; ctx.strokeStyle = col(hue + 70, 95, 70, .25 + .4*F.n[4]); ctx.stroke();
-  // cœur : la voix et la mélodie
-  const gIn = ctx.createRadialGradient(CX, CY, 0, CX, CY, R*.6);
-  gIn.addColorStop(0, col(hue + 140, 100, 85, .55 + .4*F.voice)); gIn.addColorStop(1, col(hue + 140, 100, 50, 0));
-  pathOf(inner); ctx.fillStyle = gIn; ctx.fill();
+  // membres : plus la musique est intense, plus il y en a et plus ils s'écartent en profondeur
+  const I = o3.I, satI = sat*(1 - .6*o3.dip), lit = 1 - .45*o3.dip, nL = 2 + I*4.2, gap = R*(.07 + .26*o3.spread);
+  const layers = [];
+  layers.push({ kind:"outer", pts: shape(1, 0, 0, 0), z:0, a:1 });
+  for (let j = 1; j <= 5; j++){
+    const a = clamp(nL - j); if (a <= 0.01) continue;
+    const sc = 1 - j*(.13 - .05*I), zz = -Math.ceil(j/2)*gap*(j % 2 ? 1 : -1);      // devant / derrière en alternance
+    layers.push({ kind:"limb", j, a, z:zz, pts: shape(sc + .08*F.n[Math.min(NB-1, j+1)], j*(.6 + mem.twist*.4), zz, j*Math.PI/mem.k) });
+  }
+  layers.push({ kind:"core", pts: shape(.38 + .12*F.voice, -.5, -gap*.3, 1.3), z:-gap*.3, a:1 });
+  const cz = L => proj(0, 0, L.z)[2];
+  layers.sort((A, B2) => cz(B2) - cz(A));                                   // du plus loin au plus proche
+  for (const L of layers){
+    const c0 = proj(0, 0, L.z);
+    if (L.kind === "outer"){
+      ctx.globalCompositeOperation = "source-over";
+      const g = ctx.createRadialGradient(c0[0], c0[1], R*.1, c0[0], c0[1], R*1.5);
+      g.addColorStop(0, col(hue, satI, (55 + 15*e)*lit, .95)); g.addColorStop(.6, col(hue + 25, satI, (32 + 10*e)*lit, .9)); g.addColorStop(1, col(hue + 50, satI, 14*lit, .85));
+      pathOf(L.pts); ctx.fillStyle = g; ctx.fill();
+      ctx.lineWidth = 1.5 + 3*F.n[5] + 4*F.snare; ctx.strokeStyle = col(hue - 20, 95, 72*lit, .55 + .4*F.snare); ctx.stroke();
+    } else if (L.kind === "limb"){
+      ctx.globalCompositeOperation = "lighter";
+      const h2 = hue + 35*L.j + 40*I;
+      pathOf(L.pts); ctx.fillStyle = col(h2, satI, 45*lit, (.1 + .14*F.n[3] + .1*I)*L.a); ctx.fill();
+      ctx.lineWidth = 1 + 2*F.n[4] + 2*I; ctx.strokeStyle = col(h2 + 20, 95, 70*lit, (.22 + .4*F.n[4] + .2*I)*L.a); ctx.stroke();
+    } else {
+      ctx.globalCompositeOperation = "lighter";
+      const g = ctx.createRadialGradient(c0[0], c0[1], 0, c0[0], c0[1], R*.6);
+      g.addColorStop(0, col(hue + 140, 100, 85*lit, .5 + .4*F.voice)); g.addColorStop(1, col(hue + 140, 100, 50, 0));
+      pathOf(L.pts); ctx.fillStyle = g; ctx.fill();
+    }
+  }
 
   // gouttes liquides (l'ADN du logo) : col qui s'étire depuis la membrane
   ctx.globalCompositeOperation = "source-over";
   for (const d of drops){
-    const th = d.i/M*TAU + mem.rot, rb = radiusAt(d.i), cos = Math.cos(th), sin = Math.sin(th);
-    const base = [CX + cos*rb, CY + sin*rb], dist = rb + R*.06 + d.h, p = [CX + cos*dist, CY + sin*dist];
+    const th = d.i/M*TAU + mem.rot, rb = radiusAt(d.i), zb = -mem.d[d.i]*R*.9, dist = rb + R*.06 + d.h;
+    const base = proj(Math.cos(th)*rb, Math.sin(th)*rb, zb), p = proj(Math.cos(th)*dist, Math.sin(th)*dist, zb);
+    const L2 = Math.hypot(p[0]-base[0], p[1]-base[1]) || 1, cos = (p[0]-base[0])/L2, sin = (p[1]-base[1])/L2;
     const dr = R*(.035 + .02*F.energy)*d.size*(.4 + .6*d.life);
     if (d.neck > .02){ const nx = -sin, ny = cos, wb = dr*.7, wm = Math.max(.4, wb*.35*d.neck), m = [(base[0]+p[0])/2, (base[1]+p[1])/2];
       ctx.fillStyle = col(d.hue, 90, 60, .9*d.life); ctx.beginPath(); ctx.moveTo(base[0]+nx*wb, base[1]+ny*wb);
@@ -532,6 +618,7 @@ let hudT = 0;
 function hud(now){
   if (now - hudT < 100) return; hudT = now;
   [...meters.children].forEach((m, b) => m.style.height = (2 + F.n[b]*20) + "px");
+  $("#c-int .ibar i").style.width = Math.round(o3.I*100) + "%";
   $("#c-bpm").innerHTML = F.bpm ? `<b>${Math.round(F.bpm)}</b> BPM` : "— BPM";
   $("#c-note").innerHTML = F.pc >= 0 && F.tonal > .2 ? `note <b>${NOTES[F.pc]}</b>` : F.voice > .3 ? "<b>voix</b>" : "—";
   const silent = analyser && F.loudF < -58 && now - (F._heard || now) > 2500;
@@ -570,6 +657,8 @@ function makeDemo(ac){
   function bass(t, m, d, v=.5, slide){ const o = ac.createOscillator(), g = ac.createGain(), f = ac.createBiquadFilter(); o.type = "sawtooth"; f.type = "lowpass"; f.frequency.value = 420;
     o.frequency.setValueAtTime(mtof(m-24), t); if (slide) o.frequency.exponentialRampToValueAtTime(mtof(m-24+slide), t+d*.8);
     g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(v, t+.01); g.gain.setTargetAtTime(0, t+d*.85, .05); o.connect(f).connect(g).connect(comp); o.start(t); o.stop(t+d+.2); }
+  function sub808(t, m){ const o = ac.createOscillator(), g = ac.createGain(); o.type = "sine"; o.frequency.setValueAtTime(mtof(m-36)*1.5, t); o.frequency.exponentialRampToValueAtTime(mtof(m-36), t+.06);
+    g.gain.setValueAtTime(.9, t); g.gain.exponentialRampToValueAtTime(.001, t+.7); o.connect(g).connect(comp); o.start(t); o.stop(t+.75); }
   function pad(t, notes, d, v=.08, cutoff=1800){ notes.forEach(m => [-.08,.08].forEach(det => { const o = ac.createOscillator(), g = ac.createGain(), f = ac.createBiquadFilter(); o.type = "sawtooth"; o.detune.value = det*100;
     f.type = "lowpass"; f.frequency.value = cutoff; o.frequency.value = mtof(m); g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(v, t+.4); g.gain.setTargetAtTime(0, t+d-.3, .2);
     o.connect(f).connect(g).connect(comp); o.start(t); o.stop(t+d+.6); })); }
@@ -586,22 +675,25 @@ function makeDemo(ac){
     while (next < ac.currentTime + .25){
       const bar = Math.floor(step/BAR) % 32, i = step % BAR, t = next, ch = chords[Math.floor(bar/1) % 4];
       const part = bar < 4 ? "intro" : bar < 12 ? "verse" : bar < 16 ? "build" : bar < 24 ? "drop" : bar < 28 ? "break" : "verse";
+      // coupures franches dans le drop (le beat s'arrête une demi-mesure puis repart)
+      const lvl = { intro:.25, verse:.3, build:.3 + .3*((bar - 12)*16 + i)/64, drop:.62, break:.28 }[part];
+      out.gain.setValueAtTime(part === "drop" && bar % 4 === 1 && i >= 8 ? .0001 : lvl, t);
       if (i === 0) pad(t, ch, spb*4, part === "break" ? .1 : part === "intro" ? .07 : .05, part === "break" ? 900 : part === "drop" ? 3200 : 1800);
       if (part !== "intro" && part !== "break"){
-        const K = part === "drop" ? KD : (bar % 2 ? K2 : K1); if (K[i] === "x") kick(t, part === "drop" ? 1 : .85);
+        const K = part === "drop" ? KD : (bar % 2 ? K2 : K1); if (K[i] === "x"){ kick(t, part === "drop" ? 1 : .7); if (part === "drop") sub808(t, ch[0]); }
         if (part === "build"){ const density = 1 + (bar - 12); if (i % Math.max(1, 4 - density) === 0) snare(t, .4 + .15*(bar-12) + .2*(i/16)); }
         else if (SN[i] === "x" || (bar % 4 === 3 && i >= 13)) snare(t, i >= 13 ? .6 : 1);
-        const H = part === "drop" ? HD : HT; if (H[i] === "x") hat(t, i % 4 === 0 ? .35 : .22, false); if (H[i] === "2"){ hat(t, .25); hat(t + s16/2, .2); }
+        const H = part === "drop" ? HD : HT; const hv2 = part === "drop" ? 1 : .45; if (H[i] === "x" && (part === "drop" || i % 2 === 0)) hat(t, (i % 4 === 0 ? .35 : .22)*hv2, part === "drop" && i % 8 === 6); if (H[i] === "2"){ hat(t, .25); hat(t + s16/2, .2); }
         if (i % 4 === 0 || (part === "drop" && i % 4 === 3)) bass(t, ch[0], s16*(part === "drop" ? 3 : 4), part === "drop" ? .55 : .4, part === "drop" && i === 12 ? 5 : 0);
       } else if (part === "intro" && i % 2 === 0) hat(t, .12);
-      if ((part === "verse" || part === "drop") && i % 2 === 0 && Math.random() < .55) lead(t, mel[(step/2) % 16 | 0], s16*2, part === "drop" ? .14 : .09);
+      if ((part === "drop" || (part === "verse" && bar % 2 === 1)) && i % 2 === 0 && Math.random() < (part === "drop" ? .7 : .35)) lead(t, mel[(step/2) % 16 | 0], s16*2, part === "drop" ? .14 : .09);
       if (bar === 12 && i === 0 && riserAt !== Math.floor(step/BAR)){ riserAt = Math.floor(step/BAR); riser(t, spb*16); }
       next += s16 + (i % 2 ? .012 : -.012);                                         // léger swing
       step++;
     }
   }
   timer = setInterval(schedule, 40); schedule();
-  return { out: comp, stop(){ clearInterval(timer); try { out.disconnect(); } catch {} } };
+  return { out, stop(){ clearInterval(timer); try { out.disconnect(); } catch {} } };
 }
 </script>
 </body>
