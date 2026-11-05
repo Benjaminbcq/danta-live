@@ -69,6 +69,7 @@ body.zen .hud,body.zen .feed{opacity:0!important;pointer-events:none}
 <div class="hud bottom">
   <div class="panel">
     <label for="gain"><span class="l">Sensibilité</span><input id="gain" type="range" min="0.4" max="2.5" step="0.05" value="1"></label>
+    <label for="bassk"><span class="l">Basses</span><input id="bassk" type="range" min="0.5" max="3" step="0.05" value="1.6"></label>
     <label for="react"><span class="l">Intensité visuelle</span><input id="react" type="range" min="0.4" max="2" step="0.05" value="1"></label>
     <div class="meters" id="meters" aria-hidden="true"></div>
   </div>
@@ -96,7 +97,8 @@ body.zen .hud,body.zen .feed{opacity:0!important;pointer-events:none}
 const $ = s => document.querySelector(s);
 const TAU = Math.PI*2, clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x)), lerp = (a,b,t) => a + (b-a)*t;
 const NOTES = ["do","do♯","ré","ré♯","mi","fa","fa♯","sol","sol♯","la","la♯","si"];
-const UI = { gain:1, react:1 };
+const UI = { gain:1, react:1, bass:1.6 };
+$("#bassk").addEventListener("input", e => UI.bass = +e.target.value);
 $("#gain").addEventListener("input", e => UI.gain = +e.target.value);
 $("#react").addEventListener("input", e => UI.react = +e.target.value);
 
@@ -168,7 +170,7 @@ const F = {
   rms:0, loudF:-60, loudS:-60, loudMax:-30, energy:0, bright:.5, flat:.3, tonal:0,
   chroma:new Float32Array(12), hue:150, pc:-1, pcStrength:0, voice:0,
   kick:0, snare:0, hat:0, bassHit:0,   // enveloppes d'attaque (0..1, décroissent)
-  lastK:0, lastS:0, lastH:0, lastB:0,
+  lastK:0, lastS:0, lastH:0, lastB:0, lastSub:0, low:0, lowAvg:0, lowPush:0,
   section:"calme", sectionSince:0, bpm:0, beatPhase:0, lastBeatT:0,
   history:[], profile:[], novelty:0, lastMoment:0, silentSince:0,
   onsetEnv:new Float32Array(480), oi:0
@@ -233,9 +235,14 @@ function analyse(now, dt){
   const sv = (() => { const b = F.e[4]*.4 + F.e[5]*.6, thr = (F.fluxM[4]*.4 + F.fluxM[5]*.6) + 1.6*Math.sqrt(F.fluxV[5]) + .03;
     if (b > thr && now - F.lastS > 140 && F.flat > .2){ F.lastS = now; return clamp((b-thr)*5 + .45, .3, 1.3); } return 0; })();
   const hv = onset(6, 1.3, 70, "lastH");
-  const bv = onset(2, 1.7, 220, "lastB");
+  const bv = Math.max(onset(2, 1.5, 200, "lastB"), onset(0, 1.4, 200, "lastSub"));
+  // enveloppe des basses : attaque immédiate, relâche courte, normalisée sur le morceau
+  const lowNow = Math.max(F.n[0], F.n[1]*.95, F.n[2]*.85);
+  F.low = lowNow > F.low ? lowNow : F.low + (lowNow - F.low)*(1 - Math.exp(-dt/0.12));
+  F.lowAvg += (F.low - F.lowAvg)*(1 - Math.exp(-dt/3));
+  F.lowPush = clamp((F.low - F.lowAvg*.8) * 2.2);        // ce qui dépasse la moyenne = la poussée ressentie
   F.kick = Math.max(F.kick * Math.exp(-dt/0.11), kv); F.snare = Math.max(F.snare * Math.exp(-dt/0.09), sv);
-  F.hat = Math.max(F.hat * Math.exp(-dt/0.05), hv); F.bassHit = Math.max(F.bassHit * Math.exp(-dt/0.25), bv);
+  F.hat = Math.max(F.hat * Math.exp(-dt/0.05), hv); F.bassHit = Math.max(F.bassHit * Math.exp(-dt/0.35), bv);
   if (kv) EV.emit("kick", kv); if (sv) EV.emit("snare", sv); if (hv) EV.emit("hat", hv); if (bv) EV.emit("bass", bv);
   // --- énergie globale
   const inten = clamp((F.loudF + 52) / 40);
@@ -248,7 +255,7 @@ function analyse(now, dt){
   sections(now, db);
   novelty(now);
 }
-function decayAll(dt){ for (let b = 0; b < NB; b++) F.n[b] *= .92; F.energy *= .95; F.kick *= .9; F.snare *= .9; F.hat *= .85; F.voice *= .95; }
+function decayAll(dt){ for (let b = 0; b < NB; b++) F.n[b] *= .92; F.energy *= .95; F.low *= .9; F.lowPush *= .9; F.kick *= .9; F.snare *= .9; F.hat *= .85; F.voice *= .95; }
 
 function estimateTempo(){
   const N = F.onsetEnv.length, env = new Float32Array(N), start = F.oi % N;
@@ -314,7 +321,8 @@ addEventListener("resize", resize); resize();
 
 const M = 180;                                    // points de la membrane
 const mem = { d:new Float32Array(M), v:new Float32Array(M), f:new Float32Array(M), rot:0, rotV:.15, k:3, kT:3, kMix:1, lobe:0, punch:0, tight:0, calm:0, flash:0, hueShift:0, twist:0, layersPhase:0 };
-const echoes = [], drops = [], sparks = [];
+const echoes = [], drops = [], sparks = [], bassRings = [];
+const cam = { kick:0, bass:0, sx:0, sy:0 };
 const dust = Array.from({length:420}, () => ({ a:Math.random()*TAU, r:Math.random(), z:Math.random(), v:0, life:Math.random() }));
 const col = (h, s, l, a=1) => `hsla(${((h%360)+360)%360},${s}%,${l}%,${a})`;
 
@@ -324,7 +332,8 @@ function impulse(angle, amp, width){             // coup sur la membrane, qui se
 }
 function radiusAt(i){
   const th = i/M*TAU, k = mem.k, lobe = mem.lobe * Math.cos(k*(th + mem.rot*.3)) * (1 - mem.calm*.7);
-  return R*(1 + .18*F.n[0]*UI.react + .14*F.n[2]*UI.react - .12*mem.tight + .12*mem.punch) * (1 + lobe*.22) + mem.d[i]*R;
+  const B = UI.bass;
+  return R*(.9 + .16*F.low*B + .38*F.lowPush*B + .1*F.n[0]*B - .12*mem.tight + .2*mem.punch*B) * (1 + lobe*.3) + mem.d[i]*R*(1 + .4*F.lowPush*B);
 }
 function shape(scale=1, rotOff=0){
   const pts = new Array(M);
@@ -342,9 +351,12 @@ function pathOf(pts){
 /* réactions aux évènements */
 EV.on("kick", v => {
   const a = Math.random()*TAU, R2 = UI.react;
-  impulse(a, .09*v*R2, 14); if (mem.k % 2 === 0) impulse(a + Math.PI, .07*v*R2, 12);
-  mem.punch = Math.max(mem.punch, .5*v);
-  echoes.push({ pts: shape(1.02), s:1, a:.5*v, w:2 + 4*v, hue:F.hue });
+  const B = UI.bass;
+  for (let j = 0; j < Math.max(2, Math.round(mem.k)); j++) impulse(a + j*TAU/Math.max(2, Math.round(mem.k)), .08*v*R2*B, 12);
+  mem.punch = Math.max(mem.punch, .7*v);
+  cam.kick = Math.max(cam.kick, v*B);
+  cam.sx += (Math.random()-.5)*10*v*B; cam.sy += (Math.random()-.5)*10*v*B;
+  echoes.push({ pts: shape(1.02), s:1, a:.6*v, w:3 + 7*v*B, hue:F.hue });
   if (echoes.length > 14) echoes.shift();
   dust.forEach(p => p.v += .004*v*(1 - p.r));
 });
@@ -356,7 +368,14 @@ EV.on("snare", v => {
   for (let j = 0; j < 10*v; j++) sparks.push({ a:Math.random()*TAU, r:1.05, v:.01 + .02*Math.random()*v, life:1, hue:F.hue + 40 });
 });
 EV.on("hat", v => { for (let j = 0; j < 3; j++) impulse(Math.random()*TAU, .012*v*UI.react*(Math.random() < .5 ? 1 : -1), 2); });
-EV.on("bass", v => { mem.lobe = Math.min(1.2, mem.lobe + .35*v); });
+EV.on("bass", v => {
+  const B = UI.bass;
+  mem.lobe = Math.min(1.6, mem.lobe + .5*v*B);
+  for (let i = 0; i < M; i++) mem.v[i] += .05*v*B*Math.cos(i/M*TAU*2 + mem.rot);  // toute la membrane pousse d'un bloc
+  cam.bass = Math.max(cam.bass, v*B);
+  bassRings.push({ r:1, a:.55*v, hue:F.hue - 30 });
+  if (bassRings.length > 8) bassRings.shift();
+});
 EV.on("moment", v => {
   // mutation : nouvelle symétrie, sens de rotation, décalage de couleur, torsion
   const choices = [2,3,4,5,6,7,8].filter(x => x !== mem.kT);
@@ -409,6 +428,9 @@ function step(dt, now){
     const a = c2*(l + r - 2*mem.d[i]) - k*mem.d[i] + (mem.f[i] - mem.d[i])*6 - damp*mem.v[i];
     mem.v[i] += a*dt;
   }
+  // lissage : coupe les dents de scie (modes trop aigus) pour garder une matière liquide
+  const vv = Float32Array.from(mem.v);
+  for (let i = 0; i < M; i++) mem.v[i] = vv[i]*.5 + (vv[(i-1+M)%M] + vv[(i+1)%M])*.25;
   for (let i = 0; i < M; i++){ mem.d[i] += mem.v[i]*dt*8; mem.d[i] = clamp(mem.d[i], -.45, .7); }
   // symétrie qui se transforme en douceur
   mem.k = lerp(mem.k, mem.kT, clamp(dt*1.6));
@@ -419,6 +441,9 @@ function step(dt, now){
   mem.tight = lerp(mem.tight, F.section === "montée" ? clamp((now - F.sectionSince)/6000) : 0, clamp(dt*2));
   mem.calm = lerp(mem.calm, F.section === "break" || F.section === "calme" || F.section === "silence" ? 1 : 0, clamp(dt*.8));
   mem.twist *= Math.exp(-dt/6);
+  cam.kick *= Math.exp(-dt/0.12); cam.bass *= Math.exp(-dt/0.4); cam.sx *= Math.exp(-dt/0.06); cam.sy *= Math.exp(-dt/0.06);
+  for (const b of bassRings){ b.r += dt*(1.2 + 1.5*F.low); b.a *= Math.exp(-dt/0.7); }
+  for (let i = bassRings.length - 1; i >= 0; i--) if (bassRings[i].a < .02) bassRings.splice(i, 1);
   // gouttes : lancées vers l'extérieur, rappelées vers la membrane (gravité radiale)
   for (const d of drops){ d.v -= R*.0016*(1 + F.energy) ; d.h += d.v; if (d.h <= 0){ d.h = 0; d.v = Math.abs(d.v) > R*.006 ? -d.v*.35 : 0; d.life -= .5*dt; } if (d.h > R*.04) d.neck = Math.max(0, d.neck - dt*6); else d.neck = Math.min(1, d.neck + dt*3); d.life -= dt*.15; }
   for (let i = drops.length - 1; i >= 0; i--) if (drops[i].life <= 0 || (drops[i].h === 0 && drops[i].v === 0 && drops[i].life < .9)) drops.splice(i, 1);
@@ -427,19 +452,29 @@ function step(dt, now){
   if (sparks.length > 600) sparks.splice(0, sparks.length - 600);
   // poussière : orbite, aspirée en montée, soufflée sur les coups
   const inhale = F.section === "montée" ? .0025 : 0;
-  for (const p of dust){ p.a += dt*(.05 + .4*F.energy + (F.section === "montée" ? .6 : 0))*(p.z*.6 + .4)*Math.sign(mem.rotV || 1); p.r += p.v - inhale; p.v *= .93; p.r += (.55 + p.z*.45 - p.r)*.004; if (p.r < .05) p.r = .9; }
+  for (const p of dust){ p.a += dt*(.05 + .4*F.energy + (F.section === "montée" ? .6 : 0))*(p.z*.6 + .4)*Math.sign(mem.rotV || 1); p.r += p.v - inhale + .006*F.lowPush*UI.bass*(1 - p.z*.5); p.v *= .93; p.r += (.55 + p.z*.45 - p.r)*.004; if (p.r < .05) p.r = .9; }
   for (const e of echoes){ e.s += dt*(.6 + 1.4*F.energy); e.a *= Math.exp(-dt/0.55); }
   for (let i = echoes.length - 1; i >= 0; i--) if (echoes[i].a < .02) echoes.splice(i, 1);
 }
 function draw(now){
   const hue = F.hue + mem.hueShift, sat = 70 + 25*(1 - mem.calm), e = F.energy;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
   // traînées : plus longues quand ça s'emballe
   ctx.globalCompositeOperation = "source-over";
   ctx.fillStyle = `rgba(5,6,7,${.16 + .22*(1 - e) + .2*mem.calm})`; ctx.fillRect(0,0,W,Hh);
   // halo de fond coloré par l'harmonie
   const bg = ctx.createRadialGradient(CX, CY, R*.2, CX, CY, Math.max(W,Hh)*.7);
-  bg.addColorStop(0, col(hue, sat, 12 + 18*e + 30*mem.flash, .35)); bg.addColorStop(1, "rgba(5,6,7,0)");
+  bg.addColorStop(0, col(hue, sat, 12 + 18*e + 26*F.lowPush*UI.bass + 30*mem.flash, .35 + .3*F.lowPush)); bg.addColorStop(1, "rgba(5,6,7,0)");
   ctx.fillStyle = bg; ctx.fillRect(0,0,W,Hh);
+  // caméra : zoom sur chaque kick, secousse, respiration de la basse
+  const z = 1 + .05*cam.kick + .03*cam.bass + .04*F.lowPush*UI.bass;
+  ctx.setTransform(DPR*z, 0, 0, DPR*z, DPR*(CX*(1 - z) + cam.sx), DPR*(CY*(1 - z) + cam.sy));
+  // anneaux de basse : vagues lourdes et larges qui partent du centre
+  ctx.globalCompositeOperation = "lighter";
+  for (const b of bassRings){ const rr = R*(.9 + b.r*1.3), g2 = ctx.createRadialGradient(CX, CY, rr*.75, CX, CY, rr);
+    g2.addColorStop(0, "rgba(0,0,0,0)"); g2.addColorStop(.85, col(b.hue, 90, 45, b.a*.5)); g2.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = g2; ctx.beginPath(); ctx.arc(CX, CY, rr, 0, TAU); ctx.fill(); }
+  ctx.globalCompositeOperation = "source-over";
 
   ctx.globalCompositeOperation = "lighter";
   // poussière
@@ -484,6 +519,7 @@ function draw(now){
     ctx.fillStyle = g; ctx.beginPath(); ctx.arc(p[0], p[1], dr, 0, TAU); ctx.fill();
   }
   // éclair global sur les drops
+  ctx.setTransform(DPR,0,0,DPR,0,0);
   if (mem.flash > .02){ ctx.globalCompositeOperation = "lighter"; ctx.fillStyle = col(hue + 30, 100, 70, mem.flash*.18); ctx.fillRect(0,0,W,Hh); }
   ctx.globalCompositeOperation = "source-over";
 }
